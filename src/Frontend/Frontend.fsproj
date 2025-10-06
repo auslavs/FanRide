@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src/Types.fs" />
+    <Compile Include="src/State.fs" />
+    <Compile Include="src/Program.fs" />
+    <Compile Include="src/Main.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" Version="4.0.0" />
+    <PackageReference Include="Fable.Elmish" Version="5.0.0" />
+    <PackageReference Include="Fable.Elmish.React" Version="5.0.0" />
+    <PackageReference Include="Fable.Browser.Dom" Version="2.11.0" />
+    <PackageReference Include="Feliz" Version="2.3.0" />
+  </ItemGroup>
+</Project>

@@ -2,7 +2,7 @@
 
 ## 1) Stack
 - **Language:** F# (.NET 8), 2-space indentation
-- **Frontend:** Fable + Feliz + Elmish + Tailwind
+- **Frontend:** Fable + Feliz + Elmish + Tailwind (plain Vite tooling — do **not** use `vite-fable-plugin`)
 - **Backend:** ASP.NET Core F#, SignalR
 - **Datastore:** Azure Cosmos DB (Core SQL API) via Azure.Cosmos .NET SDK
 - **Trainer Agent:** F# console (BLE FTMS / ANT+ FE-C)
