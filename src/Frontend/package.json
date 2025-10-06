@@ -1,0 +1,33 @@
+{
+  "name": "fanride-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "fable:watch": "dotnet fable watch ./Frontend.fsproj --outDir ./.fable-build --define VITE --define NETSTANDARD2_0",
+    "fable:build": "dotnet fable ./Frontend.fsproj --outDir ./.fable-build --define VITE --define NETSTANDARD2_0",
+    "prestart": "dotnet tool restore",
+    "prebuild": "dotnet tool restore",
+    "vite": "vite",
+    "vite:build": "vite build",
+    "start": "npm-run-all --parallel fable:watch vite",
+    "build": "npm-run-all fable:build vite:build",
+    "tailwind": "tailwindcss -i ./src/tailwind.css -o ./dist/tailwind.css --watch"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/forms": "^0.5.10",
+    "@types/node": "^20.11.10",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.14",
+    "vite": "^7.0.0",
+    "npm-run-all": "^4.1.5",
+    "@tailwindcss/postcss": "^4.1.14"
+  }
+}
