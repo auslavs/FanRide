@@ -3,6 +3,7 @@ namespace FanRide
 open System
 open System.Threading.Tasks
 open Microsoft.AspNetCore.SignalR
+open Microsoft.Extensions.Logging
 
 [<CLIMutable>]
 type MetricsDto =
@@ -17,8 +18,17 @@ type MatchStateDto =
     Quarter: int
     Clock: string }
 
-type MatchHub() =
+type MatchHub(
+  readModels: IReadModelService,
+  logger: ILogger<MatchHub>
+) =
   inherit Hub()
+
+  let toHubMatchState (model: MatchStateReadModelDto) : MatchStateDto =
+    { ScoreHome = model.ScoreHome
+      ScoreAway = model.ScoreAway
+      Quarter = model.Quarter
+      Clock = model.Clock }
 
   member this.SendMetrics(watts: int, cadence: int, heartRate: int) =
     task {
@@ -31,4 +41,28 @@ type MatchHub() =
 
   member this.BroadcastMatchState(state: MatchStateDto) =
     this.Clients.All.SendAsync("matchState", state)
+
+  member this.SubscribeToStream(streamId: string) =
+    task {
+      if String.IsNullOrWhiteSpace(streamId) then
+        logger.LogWarning("Received subscription with empty stream id from connection {ConnectionId}", this.Context.ConnectionId)
+      else
+        let! matchState = readModels.GetMatchState(streamId)
+        match matchState with
+        | Some state ->
+            do! this.Clients.Caller.SendAsync("matchState", toHubMatchState state)
+        | None ->
+            logger.LogDebug(
+              "No match state read model available for stream {StreamId} when subscribing",
+              streamId
+            )
+
+        let! tesMomentum = readModels.GetTesMomentum(streamId)
+        match tesMomentum with
+        | Some momentum -> do! this.Clients.Caller.SendAsync("tesHistory", momentum)
+        | None -> ()
+
+        let! leaderboard = readModels.GetLeaderboard()
+        do! this.Clients.Caller.SendAsync("leaderboard", leaderboard)
+    } :> Task
 

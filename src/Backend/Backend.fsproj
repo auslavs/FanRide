@@ -8,6 +8,7 @@
     <Compile Include="Config.fs" />
     <Compile Include="Domain.fs" />
     <Compile Include="EventStore.fs" />
+    <Compile Include="ReadModels.fs" />
     <Compile Include="SignalR.fs" />
     <Compile Include="AflFeed.fs" />
     <Compile Include="ChangeFeed.fs" />

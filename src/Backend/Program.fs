@@ -220,13 +220,14 @@ module Program =
     match builder.Configuration.GetSection("Azure:SignalR:ConnectionString").Value with
     | null | "" -> ()
     | _ -> signalRBuilder.AddAzureSignalR() |> ignore
+    builder.Services.AddSingleton<IReadModelService, ReadModelService>() |> ignore
     builder.Services.AddHostedService<ChangeFeedProjector>() |> ignore
     builder.Services.AddHttpClient<IAflFeedClient, AflFeedClient>() |> ignore
     builder.Services.AddHostedService<AflFeedIngestionService>() |> ignore
 
     let app = builder.Build()
 
-    app.UseCors("frontend")
+    app.UseCors("frontend") |> ignore
 
     app.MapGet("/", Func<IResult>(fun () -> Results.Ok("FanRide backend running"))) |> ignore
 
@@ -249,6 +250,30 @@ module Program =
         | ValueNone -> return Results.NotFound()
       }
     )) |> ignore
+
+    app.MapGet(
+      "/api/readmodels/tes/{streamId}",
+      Func<string, IReadModelService, Task<IResult>>(fun streamId readModels ->
+        task {
+          let! momentum = readModels.GetTesMomentum(streamId)
+          match momentum with
+          | Some dto -> return Results.Ok(dto)
+          | None -> return Results.NotFound()
+        }
+      )
+    )
+    |> ignore
+
+    app.MapGet(
+      "/api/readmodels/leaderboard",
+      Func<IReadModelService, Task<IResult>>(fun readModels ->
+        task {
+          let! dto = readModels.GetLeaderboard()
+          return Results.Ok(dto)
+        }
+      )
+    )
+    |> ignore
 
     let appendRoute returnSnapshot =
       Func<string, AppendEventsRequestDto, CosmosClient, CosmosConfig, IHubContext<MatchHub>, Task<IResult>>

@@ -25,3 +25,18 @@ type ConnectionStatus =
   | Connecting
   | Connected
   | Error of string
+
+[<CLIMutable>]
+type TesMomentumPoint =
+  { Watts: int
+    Cadence: int
+    HeartRate: int
+    CapturedAt: DateTime }
+
+[<CLIMutable>]
+type LeaderboardEntry =
+  { RiderId: string
+    Watts: int
+    Cadence: int
+    HeartRate: int
+    UpdatedAt: DateTime }
