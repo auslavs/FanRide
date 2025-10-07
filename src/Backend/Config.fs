@@ -31,6 +31,24 @@ type CosmosConfig =
     ConsistencyLevel: string
     UseSameType: bool }
 
+[<CLIMutable>]
+type ChangeFeedConfig =
+  { Mode: string }
+
+[<CLIMutable>]
+type AflFeedConfig =
+  { Enabled: bool
+    StreamId: string
+    Endpoint: string
+    PollIntervalSeconds: int
+    ApiKeyHeader: string
+    ApiKey: string }
+
+[<RequireQualifiedAccess>]
+type ChangeFeedMode =
+  | Live
+  | Rebuild
+
 [<RequireQualifiedAccess>]
 type FanRideEnvironment =
   | Development
@@ -80,5 +98,19 @@ module CosmosConfiguration =
 
   let ensureStrongConsistency (cfg: CosmosConfig) =
     if not (cfg.ConsistencyLevel.Equals("Strong", StringComparison.OrdinalIgnoreCase)) then
-      invalidOp "FanRide requires Strong consistency for Cosmos DB." 
+      invalidOp "FanRide requires Strong consistency for Cosmos DB."
+
+  let ensureDataParity (cfg: CosmosConfig) =
+    if not cfg.UseSameType then
+      invalidOp "FanRide requires Cosmos DB across all environments. Set 'useSameType' to true."
+
+module ChangeFeedConfiguration =
+  let parseMode (mode: string) =
+    match mode with
+    | null
+    | "" -> ChangeFeedMode.Live
+    | m when m.Equals("rebuild", StringComparison.OrdinalIgnoreCase) -> ChangeFeedMode.Rebuild
+    | m when m.Equals("startfrombeginning", StringComparison.OrdinalIgnoreCase) -> ChangeFeedMode.Rebuild
+    | m when m.Equals("live", StringComparison.OrdinalIgnoreCase) -> ChangeFeedMode.Live
+    | _ -> ChangeFeedMode.Live
 

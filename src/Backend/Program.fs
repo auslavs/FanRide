@@ -43,11 +43,23 @@ type AppendEventsRequestDto =
     Snapshot: SnapshotDto
     Events: AppendEventDto list }
 
+[<CLIMutable>]
+type AflMatchSnapshotResponseDto =
+  { StreamId: string
+    AggregateVersion: int
+    Etag: string
+    State: SnapshotDto }
+
 module private ProgramHelpers =
   let toMatchState (snapshot: SnapshotDto) =
     { Score = { Home = snapshot.Score.Home; Away = snapshot.Score.Away }
       Quarter = snapshot.Quarter
       Clock = snapshot.Clock }
+
+  let toSnapshotDto (state: MatchState) : SnapshotDto =
+    { Score = { Home = state.Score.Home; Away = state.Score.Away }
+      Quarter = state.Quarter
+      Clock = state.Clock }
 
   let private tryDeserialize<'T> (element: JsonElement) =
     try
@@ -70,6 +82,78 @@ module private ProgramHelpers =
       Kind = dto.Kind
       Payload = payload }
 
+  let private toHubMatchState (state: MatchState) : MatchStateDto =
+    { ScoreHome = state.Score.Home
+      ScoreAway = state.Score.Away
+      Quarter = state.Quarter
+      Clock = state.Clock }
+
+  let toSnapshotEnvelope streamId version etag (state: MatchState) : AflMatchSnapshotResponseDto =
+    { StreamId = streamId
+      AggregateVersion = version
+      Etag = etag
+      State = toSnapshotDto state }
+
+  let tryReadSnapshot (streamId: string) (client: CosmosClient) (cfg: CosmosConfig) =
+    task {
+      try
+        let container = client.GetContainer(cfg.Database, cfg.Containers.Es)
+        let! response = container.ReadItemAsync<JObject>($"snap-{streamId}", PartitionKey(streamId))
+        match response.Resource.["state"] with
+        | null -> return ValueNone
+        | stateToken ->
+            let state = stateToken.ToObject<MatchState>()
+            let aggVersionNullable = response.Resource.Value<Nullable<int>>("aggVersion")
+            let aggVersion = if aggVersionNullable.HasValue then aggVersionNullable.Value else 0
+            return ValueSome(state, aggVersion, response.ETag)
+      with :? CosmosException as ex when ex.StatusCode = System.Net.HttpStatusCode.NotFound ->
+        return ValueNone
+    }
+
+  let private broadcastMatchState (hub: IHubContext<MatchHub>) (events: NewEvent list) =
+    task {
+      match events |> List.tryFind (fun ev -> ev.Kind.Equals("MatchStateUpdated", StringComparison.OrdinalIgnoreCase)) with
+      | Some evt ->
+          match evt.Payload with
+          | EventPayload.MatchStateUpdated state ->
+              let hubState = toHubMatchState state
+              do! hub.Clients.All.SendAsync("matchState", hubState)
+          | _ -> ()
+      | None -> ()
+    }
+
+  let handleAppendEvents returnSnapshot streamId (dto: AppendEventsRequestDto) (client: CosmosClient) (cfg: CosmosConfig) (hub: IHubContext<MatchHub>) =
+    task {
+      let expectedEtag =
+        if String.IsNullOrWhiteSpace(dto.ExpectedEtag) then None else Some dto.ExpectedEtag
+
+      let domainEvents = dto.Events |> List.map toDomainEvent
+      let snapshotState = dto.Snapshot |> toMatchState
+      let appendRequest =
+        { StreamId = streamId
+          ExpectedVersion = dto.ExpectedVersion
+          ExpectedEtag = expectedEtag
+          Snapshot = EventStore.serializeSnapshot snapshotState
+          Events = domainEvents }
+
+      let! result = EventStore.appendWithSnapshot client cfg.Database cfg.Containers.Es appendRequest
+      match result with
+      | Ok () ->
+          do! broadcastMatchState hub domainEvents
+          if returnSnapshot then
+            let! snapshot = tryReadSnapshot streamId client cfg
+            match snapshot with
+            | ValueSome(state, version, etag) ->
+                let envelope = toSnapshotEnvelope streamId version etag state
+                return Results.Ok(envelope)
+            | ValueNone ->
+                return Results.Accepted()
+          else
+            return Results.Accepted()
+      | Error err ->
+          return Results.Problem(err, statusCode = 412)
+    }
+
 open ProgramHelpers
 
 module Program =
@@ -79,6 +163,10 @@ module Program =
 
     builder.Services.Configure<CosmosConfig>(builder.Configuration.GetSection("cosmos")) |> ignore
     builder.Services.AddSingleton<CosmosConfig>(fun sp -> sp.GetRequiredService<IOptions<CosmosConfig>>().Value) |> ignore
+    builder.Services.Configure<ChangeFeedConfig>(builder.Configuration.GetSection("changeFeed")) |> ignore
+    builder.Services.AddSingleton<ChangeFeedConfig>(fun sp -> sp.GetRequiredService<IOptions<ChangeFeedConfig>>().Value) |> ignore
+    builder.Services.Configure<AflFeedConfig>(builder.Configuration.GetSection("aflFeed")) |> ignore
+    builder.Services.AddSingleton<AflFeedConfig>(fun sp -> sp.GetRequiredService<IOptions<AflFeedConfig>>().Value) |> ignore
 
     builder.Services.AddApplicationInsightsTelemetry() |> ignore
 
@@ -120,6 +208,7 @@ module Program =
     builder.Services.AddSingleton<CosmosClient>(fun sp ->
       let cfg = sp.GetRequiredService<CosmosConfig>()
       CosmosConfiguration.ensureStrongConsistency cfg
+      CosmosConfiguration.ensureDataParity cfg
       let env = CosmosConfiguration.getEnvironment cfg builder.Environment.EnvironmentName
       let options = CosmosClientOptions()
       options.ConsistencyLevel <- ConsistencyLevel.Strong
@@ -132,6 +221,8 @@ module Program =
     | null | "" -> ()
     | _ -> signalRBuilder.AddAzureSignalR() |> ignore
     builder.Services.AddHostedService<ChangeFeedProjector>() |> ignore
+    builder.Services.AddHttpClient<IAflFeedClient, AflFeedClient>() |> ignore
+    builder.Services.AddHostedService<AflFeedIngestionService>() |> ignore
 
     let app = builder.Build()
 
@@ -141,57 +232,31 @@ module Program =
 
     app.MapGet("/api/matches/{streamId}", Func<string, CosmosClient, CosmosConfig, Task<IResult>>(fun streamId client cfg ->
       task {
-        try
-          let container = client.GetContainer(cfg.Database, cfg.Containers.Es)
-          let! response = container.ReadItemAsync<JObject>($"snap-{streamId}", PartitionKey(streamId))
-          let stateToken = response.Resource.["state"]
-          if isNull stateToken then
-            return Results.NotFound()
-          else
-            let state = stateToken.ToObject<MatchState>()
-            return Results.Ok(state)
-        with :? CosmosException as ex when ex.StatusCode = System.Net.HttpStatusCode.NotFound ->
-          return Results.NotFound()
+        let! snapshot = tryReadSnapshot streamId client cfg
+        match snapshot with
+        | ValueSome(state, _, _) -> return Results.Ok(state)
+        | ValueNone -> return Results.NotFound()
       }
     )) |> ignore
 
-    app.MapPost("/api/matches/{streamId}/events",
+    app.MapGet("/api/afl/matches/{streamId}", Func<string, CosmosClient, CosmosConfig, Task<IResult>>(fun streamId client cfg ->
+      task {
+        let! snapshot = tryReadSnapshot streamId client cfg
+        match snapshot with
+        | ValueSome(state, version, etag) ->
+            let envelope = toSnapshotEnvelope streamId version etag state
+            return Results.Ok(envelope)
+        | ValueNone -> return Results.NotFound()
+      }
+    )) |> ignore
+
+    let appendRoute returnSnapshot =
       Func<string, AppendEventsRequestDto, CosmosClient, CosmosConfig, IHubContext<MatchHub>, Task<IResult>>
-        (fun streamId dto client cfg hub ->
-          task {
-            let expectedEtag =
-              if String.IsNullOrWhiteSpace(dto.ExpectedEtag) then None else Some dto.ExpectedEtag
+        (fun streamId dto client cfg hub -> handleAppendEvents returnSnapshot streamId dto client cfg hub)
 
-            let domainEvents = dto.Events |> List.map toDomainEvent
-            let snapshotState = dto.Snapshot |> toMatchState
-            let appendRequest =
-              { StreamId = streamId
-                ExpectedVersion = dto.ExpectedVersion
-                ExpectedEtag = expectedEtag
-                Snapshot = EventStore.serializeSnapshot snapshotState
-                Events = domainEvents }
+    app.MapPost("/api/matches/{streamId}/events", appendRoute false) |> ignore
 
-            let! result = EventStore.appendWithSnapshot client cfg.Database cfg.Containers.Es appendRequest
-            match result with
-            | Ok () ->
-                match domainEvents |> List.tryFind (fun ev -> ev.Kind.Equals("MatchStateUpdated", StringComparison.OrdinalIgnoreCase)) with
-                | Some evt ->
-                    match evt.Payload with
-                    | EventPayload.MatchStateUpdated state ->
-                        let hubState =
-                          { ScoreHome = state.Score.Home
-                            ScoreAway = state.Score.Away
-                            Quarter = state.Quarter
-                            Clock = state.Clock }
-                        do! hub.Clients.All.SendAsync("matchState", hubState)
-                    | _ -> ()
-                | None -> ()
-                return Results.Accepted()
-            | Error err ->
-                return Results.Problem(err, statusCode = 412)
-          }
-        )
-    ) |> ignore
+    app.MapPost("/api/afl/matches/{streamId}/apply", appendRoute true) |> ignore
 
     app.MapHub<MatchHub>("/hub/match") |> ignore
 
