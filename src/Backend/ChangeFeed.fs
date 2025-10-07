@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
+open System.Net
 open Microsoft.Azure.Cosmos
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
@@ -40,17 +41,49 @@ module private ChangeFeedHelpers =
 
 open ChangeFeedHelpers
 
-type ChangeFeedProjector(client: CosmosClient, cfg: CosmosConfig, logger: ILogger<ChangeFeedProjector>) =
+type ChangeFeedProjector
+  (
+    client: CosmosClient,
+    cosmosCfg: CosmosConfig,
+    changeFeedCfg: ChangeFeedConfig,
+    logger: ILogger<ChangeFeedProjector>
+  ) =
   inherit BackgroundService()
 
-  let database = client.GetDatabase(cfg.Database)
-  let esContainer = database.GetContainer(cfg.Containers.Es)
-  let leasesContainer = database.GetContainer(cfg.Containers.Leases)
-  let matchStateContainer = database.GetContainer(cfg.Containers.RmMatchState)
-  let tesHistoryContainer = database.GetContainer(cfg.Containers.RmTesHistory)
-  let leaderboardContainer = database.GetContainer(cfg.Containers.RmLeaderboard)
+  let database = client.GetDatabase(cosmosCfg.Database)
+  let esContainer = database.GetContainer(cosmosCfg.Containers.Es)
+  let leasesContainer = database.GetContainer(cosmosCfg.Containers.Leases)
+  let matchStateContainer = database.GetContainer(cosmosCfg.Containers.RmMatchState)
+  let tesHistoryContainer = database.GetContainer(cosmosCfg.Containers.RmTesHistory)
+  let leaderboardContainer = database.GetContainer(cosmosCfg.Containers.RmLeaderboard)
+  let changeFeedMode = ChangeFeedConfiguration.parseMode changeFeedCfg.Mode
 
   let projectorName = "fanride-read-models"
+
+  let purgeLeasesIfNeeded () =
+    task {
+      if changeFeedMode = ChangeFeedMode.Rebuild then
+        logger.LogWarning(
+          "Clearing existing leases in container {Container} to rebuild read models",
+          cosmosCfg.Containers.Leases
+        )
+        let iterator = leasesContainer.GetItemQueryIterator<JObject>()
+        while iterator.HasMoreResults do
+          let! response = iterator.ReadNextAsync()
+          for lease in response do
+            match lease.Value<string>("id") with
+            | null -> ()
+            | id ->
+                try
+                  do!
+                    leasesContainer.DeleteItemAsync<JObject>(
+                      id,
+                      PartitionKey(id)
+                    )
+                    :> Task
+                with :? CosmosException as ex when ex.StatusCode = System.Net.HttpStatusCode.NotFound ->
+                  ()
+    }
 
   let handleSnapshot (doc: JObject) =
     task {
@@ -118,18 +151,27 @@ type ChangeFeedProjector(client: CosmosClient, cfg: CosmosConfig, logger: ILogge
 
   let processorLazy =
     lazy (
-      esContainer
-        .GetChangeFeedProcessorBuilder<JObject>(
-          projectorName,
-          changeFeedHandler
-        )
-        .WithInstanceName(Environment.MachineName)
+      let builder =
+        esContainer
+          .GetChangeFeedProcessorBuilder<JObject>(
+            projectorName,
+            changeFeedHandler
+          )
+          .WithInstanceName(Environment.MachineName)
+      let builder =
+        match changeFeedMode with
+        | ChangeFeedMode.Live -> builder
+        | ChangeFeedMode.Rebuild ->
+            logger.LogWarning("Change feed projector {Name} starting from beginning", projectorName)
+            builder.WithStartTime(DateTime.MinValue)
+      builder
         .WithLeaseContainer(leasesContainer)
         .Build()
     )
 
   override _.ExecuteAsync(ct: CancellationToken) =
     task {
+      do! purgeLeasesIfNeeded()
       let processor = processorLazy.Value
       do! processor.StartAsync()
       logger.LogInformation("Change feed processor {Name} started", projectorName)
