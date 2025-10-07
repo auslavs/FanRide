@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open System.Net
+open Microsoft.AspNetCore.SignalR
 open Microsoft.Azure.Cosmos
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
@@ -42,10 +43,12 @@ module private ChangeFeedHelpers =
 open ChangeFeedHelpers
 
 type ChangeFeedProjector
-  (
+  ( 
     client: CosmosClient,
     cosmosCfg: CosmosConfig,
     changeFeedCfg: ChangeFeedConfig,
+    hub: IHubContext<MatchHub>,
+    readModels: IReadModelService,
     logger: ILogger<ChangeFeedProjector>
   ) =
   inherit BackgroundService()
@@ -101,6 +104,10 @@ type ChangeFeedProjector
           body["updatedAt"] <- JValue(DateTime.UtcNow)
           let! _ = matchStateContainer.UpsertItemAsync(body, PartitionKey(streamId))
           logger.LogDebug("Snapshot projected for {StreamId}", streamId)
+          let! snapshot = readModels.GetMatchState(streamId)
+          match snapshot with
+          | Some state -> do! hub.Clients.All.SendAsync("matchState", { ScoreHome = state.ScoreHome; ScoreAway = state.ScoreAway; Quarter = state.Quarter; Clock = state.Clock })
+          | None -> ()
           return ()
       | None -> return ()
     }
@@ -127,8 +134,55 @@ type ChangeFeedProjector
           let! _ = tesHistoryContainer.UpsertItemAsync(history, PartitionKey(streamId))
           let! _ = leaderboardContainer.UpsertItemAsync(leaderboard, PartitionKey(streamId))
           logger.LogDebug("Trainer metrics projected for {StreamId}", streamId)
+          let! momentum = readModels.GetTesMomentum(streamId)
+          match momentum with
+          | Some dto -> do! hub.Clients.All.SendAsync("tesHistory", dto)
+          | None -> ()
+          let! leaderboardDto = readModels.GetLeaderboard()
+          do! hub.Clients.All.SendAsync("leaderboard", leaderboardDto)
           return ()
       | _ -> return ()
+    }
+
+  let handleOutbox (doc: JObject) =
+    task {
+      match getStreamId doc, doc.Value<string>("id") |> Option.ofObj with
+      | Some streamId, Some id ->
+          let kind = doc.Value<string>("kind")
+          match kind with
+          | null -> return ()
+          | k when k.Equals("trainerEffect", StringComparison.OrdinalIgnoreCase) ->
+              let payloadToken =
+                match tryGetToken doc "payload" with
+                | Some token when not (isNull token) -> token :> JToken
+                | _ -> JObject()
+              let payload =
+                match payloadToken with
+                | :? JObject as obj ->
+                    obj.Properties()
+                    |> Seq.map (fun prop -> prop.Name, prop.Value.ToObject<obj>())
+                    |> dict
+                    :> IDictionary<string, obj>
+                | _ -> dict [] :> IDictionary<string, obj>
+              let enqueuedAt =
+                doc.Value<Nullable<DateTime>>("ts")
+                |> Option.ofNullable
+                |> Option.defaultValue DateTime.UtcNow
+              let dto : TrainerEffectDto =
+                { StreamId = streamId
+                  Id = id
+                  Kind = kind
+                  Payload = payload
+                  EnqueuedAt = enqueuedAt }
+              do! hub.Clients.All.SendAsync("trainerEffect", dto)
+              try
+                let operations = Collections.Generic.List<PatchOperation>()
+                operations.Add(PatchOperation.Add("processedAt", DateTime.UtcNow))
+                let! _ = esContainer.PatchItemAsync(id, PartitionKey(streamId), operations)
+                ()
+              with :? CosmosException as ex when ex.StatusCode = System.Net.HttpStatusCode.NotFound -> ()
+          | _ -> ()
+      | _ -> ()
     }
 
   let handleChanges (_: ChangeFeedProcessorContext) (changes: IReadOnlyCollection<JObject>) =
@@ -142,6 +196,8 @@ type ChangeFeedProjector
             | kind when String.Equals(kind, "TrainerMetricsCaptured", StringComparison.OrdinalIgnoreCase) ->
                 do! handleTrainerMetrics doc
             | _ -> ()
+        | "outbox" ->
+            do! handleOutbox doc
         | _ -> ()
     }
 

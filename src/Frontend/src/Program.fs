@@ -34,11 +34,45 @@ module App =
       HeartRate = payload?heartRate |> unbox<int>
       CapturedAt = DateTime.UtcNow }
 
+  let private parseIso (value: string) =
+    match DateTime.TryParse(value) with
+    | true, parsed -> parsed
+    | _ -> DateTime.UtcNow
+
+  let private toTesMomentum (payload: obj) =
+    let points: obj array = payload?points |> unbox
+    points
+    |> Array.map (fun point ->
+      { Watts = point?watts |> unbox<int>
+        Cadence = point?cadence |> unbox<int>
+        HeartRate = point?heartRate |> unbox<int>
+        CapturedAt = point?capturedAt |> unbox<string> |> parseIso })
+    |> Array.toList
+
+  let private toLeaderboard (payload: obj) =
+    let entries: obj array = payload?entries |> unbox
+    entries
+    |> Array.map (fun entry ->
+      { RiderId = entry?riderId |> unbox<string>
+        Watts = entry?watts |> unbox<int>
+        Cadence = entry?cadence |> unbox<int>
+        HeartRate = entry?heartRate |> unbox<int>
+        UpdatedAt = entry?updatedAt |> unbox<string> |> parseIso })
+    |> Array.toList
+
   let private registerHandlers (conn: obj) (dispatch: Msg -> unit) =
     conn?on("matchState", fun payload ->
       payload |> toMatchState |> MatchStateArrived |> dispatch)
     conn?on("metrics", fun payload ->
       payload |> toMetrics |> MetricsTick |> dispatch)
+    conn?on("tesHistory", fun payload ->
+      payload |> toTesMomentum |> TesMomentumUpdated |> dispatch)
+    conn?on("leaderboard", fun payload ->
+      payload |> toLeaderboard |> LeaderboardUpdated |> dispatch)
+    conn?on("trainerEffect", fun payload ->
+      let streamId: string = payload?streamId |> unbox
+      let kind: string = payload?kind |> unbox
+      TrainerEffectReceived(streamId, kind) |> dispatch)
     conn
 
   let private startConnection dispatch =
@@ -79,9 +113,27 @@ module App =
       | None ->
           return Result.Error "No active SignalR connection"
     }
+
+  let private subscribe streamId =
+    async {
+      match connection with
+      | Some conn ->
+          let promise: JS.Promise<obj> = conn?invoke("SubscribeToStream", streamId)
+          try
+            do! awaitUnit promise
+            return Ok()
+          with ex ->
+            return Result.Error ex.Message
+      | None ->
+          return Result.Error "No active SignalR connection"
+    }
 #else
   let private sendMetrics (_: TrainerMetrics) = async { return Ok() }
   let private startConnection (_: Msg -> unit) = ()
+#endif
+
+#if !FABLE_COMPILER
+  let private subscribe (_: string) = async { return Ok() }
 #endif
 
   let init () = State.init()
@@ -96,10 +148,31 @@ module App =
 #else
         model', cmd'
 #endif
+    | ConnectionEstablished _ ->
+#if FABLE_COMPILER
+        let trigger = Cmd.ofMsg SubscribeToStream
+        model', Cmd.batch [ cmd'; trigger ]
+#else
+        model', cmd'
+#endif
+    | SubscribeToStream ->
+#if FABLE_COMPILER
+        let subscribeCmd =
+          Cmd.OfAsync.either
+            subscribe
+            model'.ActiveStreamId
+            SubscriptionCompleted
+            (fun ex -> SubscriptionCompleted(Result.Error ex.Message))
+        model', Cmd.batch [ cmd'; subscribeCmd ]
+#else
+        model', cmd'
+#endif
     | ConnectionFailed _ ->
 #if FABLE_COMPILER
         connection <- None
 #endif
+        model', cmd'
+    | SubscriptionCompleted _ ->
         model', cmd'
     | _ ->
         model', cmd'
@@ -111,6 +184,92 @@ module App =
       | ConnectionStatus.Connecting -> "Connecting"
       | ConnectionStatus.Connected -> "Connected"
       | ConnectionStatus.Error error -> $"Error: {error}"
+
+    let momentumSeries =
+      model.TesMomentum
+      |> List.sortBy (fun point -> point.CapturedAt)
+      |> fun points ->
+           let count = List.length points
+           if count > 40 then points |> List.skip (count - 40) else points
+
+    let latestMomentum = momentumSeries |> List.tryLast
+
+    let sparkline =
+      match momentumSeries with
+      | [] ->
+          Html.p [
+            prop.className "text-sm text-slate-500"
+            prop.text "Waiting for TES momentum data"
+          ]
+      | data ->
+          let width = 320
+          let height = 120
+          let widthF = float width
+          let heightF = float height
+          let minWatts = data |> List.minBy (fun p -> p.Watts) |> fun p -> p.Watts
+          let maxWatts = data |> List.maxBy (fun p -> p.Watts) |> fun p -> p.Watts
+          let range = float (max 1 (maxWatts - minWatts))
+          let step = if data.Length <= 1 then 0. else widthF / float (max 1 (data.Length - 1))
+          let pointsString =
+            data
+            |> List.mapi (fun idx point ->
+              let x = if data.Length <= 1 then widthF else step * float idx
+              let normalized = (float (point.Watts - minWatts)) / range
+              let y = heightF - (normalized * heightF)
+              sprintf "%.2f,%.2f" x y)
+            |> String.concat " "
+          Svg.svg [
+            svg.viewBox (0, 0, width, height)
+            svg.className "w-full h-32"
+            svg.children [
+              Svg.polyline [
+                svg.points pointsString
+                svg.fill "none"
+                svg.stroke "#22d3ee"
+                svg.strokeWidth 3
+              ]
+            ]
+          ]
+
+    let leaderboardRows =
+      if List.isEmpty model.Leaderboard then
+        Html.p [
+          prop.className "text-sm text-slate-500"
+          prop.text "Leaderboard projections unavailable"
+        ]
+      else
+        Html.table [
+          prop.className "w-full border-collapse text-sm"
+          prop.children [
+            Html.thead [
+              Html.tr [
+                prop.className "text-left text-slate-400"
+                prop.children [
+                  Html.th [ prop.className "py-2"; prop.text "Rider" ]
+                  Html.th [ prop.className "py-2 text-right"; prop.text "Watts" ]
+                  Html.th [ prop.className "py-2 text-right"; prop.text "Cadence" ]
+                  Html.th [ prop.className "py-2 text-right"; prop.text "HR" ]
+                ]
+              ]
+            ]
+            Html.tbody [
+              prop.children (
+                model.Leaderboard
+                |> List.mapi (fun idx entry ->
+                  Html.tr [
+                    prop.className (if idx = 0 then "bg-slate-800/60" else "")
+                    prop.children [
+                      Html.td [ prop.className "py-2 font-medium"; prop.text entry.RiderId ]
+                      Html.td [ prop.className "py-2 text-right"; prop.text (string entry.Watts) ]
+                      Html.td [ prop.className "py-2 text-right"; prop.text (string entry.Cadence) ]
+                      Html.td [ prop.className "py-2 text-right"; prop.text (string entry.HeartRate) ]
+                    ]
+                  ])
+                |> List.toArray)
+            ]
+          ]
+        ]
+
     Html.section [
       prop.className "min-h-screen bg-slate-950 text-slate-100"
       prop.children [
@@ -128,7 +287,7 @@ module App =
           ]
         ]
         Html.main [
-          prop.className "px-6 py-10 grid gap-6 md:grid-cols-2"
+          prop.className "px-6 py-10 grid gap-6 lg:grid-cols-3"
           prop.children [
             Html.div [
               prop.className "rounded-xl border border-slate-800 bg-slate-900/70 p-6"
@@ -190,7 +349,53 @@ module App =
               ]
             ]
             Html.div [
-              prop.className "md:col-span-2 rounded-xl border border-slate-800 bg-slate-900/70 p-6"
+              prop.className "rounded-xl border border-slate-800 bg-slate-900/70 p-6 lg:col-span-2"
+              prop.children [
+                Html.h2 [
+                  prop.className "text-lg font-medium mb-4"
+                  prop.text "TES Momentum"
+                ]
+                sparkline
+                match latestMomentum with
+                | Some point ->
+                    Html.dl [
+                      prop.className "mt-4 grid grid-cols-3 gap-4"
+                      prop.children [
+                        Html.div [
+                          prop.children [
+                            Html.dt [ prop.className "text-xs uppercase tracking-wide text-slate-500"; prop.text "Watts" ]
+                            Html.dd [ prop.className "text-2xl font-semibold"; prop.text (string point.Watts) ]
+                          ]
+                        ]
+                        Html.div [
+                          prop.children [
+                            Html.dt [ prop.className "text-xs uppercase tracking-wide text-slate-500"; prop.text "Cadence" ]
+                            Html.dd [ prop.className "text-2xl font-semibold"; prop.text (string point.Cadence) ]
+                          ]
+                        ]
+                        Html.div [
+                          prop.children [
+                            Html.dt [ prop.className "text-xs uppercase tracking-wide text-slate-500"; prop.text "Heart Rate" ]
+                            Html.dd [ prop.className "text-2xl font-semibold"; prop.text (string point.HeartRate) ]
+                          ]
+                        ]
+                      ]
+                    ]
+                | None -> Html.none
+              ]
+            ]
+            Html.div [
+              prop.className "rounded-xl border border-slate-800 bg-slate-900/70 p-6"
+              prop.children [
+                Html.h2 [
+                  prop.className "text-lg font-medium mb-4"
+                  prop.text "Leaderboard"
+                ]
+                leaderboardRows
+              ]
+            ]
+            Html.div [
+              prop.className "lg:col-span-3 rounded-xl border border-slate-800 bg-slate-900/70 p-6"
               prop.children [
                 Html.h2 [
                   prop.className "text-lg font-medium mb-4"

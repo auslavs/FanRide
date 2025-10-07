@@ -8,6 +8,9 @@ type Model =
   { Status: ConnectionStatus
     Match: MatchState
     Metrics: TrainerMetrics
+    TesMomentum: TesMomentumPoint list
+    Leaderboard: LeaderboardEntry list
+    ActiveStreamId: string
     Notifications: string list }
 
 type Msg =
@@ -18,6 +21,11 @@ type Msg =
   | MetricsTick of TrainerMetrics
   | SendMetrics
   | MetricsSent of Result<unit, string>
+  | TesMomentumUpdated of TesMomentumPoint list
+  | LeaderboardUpdated of LeaderboardEntry list
+  | TrainerEffectReceived of streamId: string * kind: string
+  | SubscribeToStream
+  | SubscriptionCompleted of Result<unit, string>
   | ClearNotification of int
 
 module State =
@@ -32,6 +40,9 @@ module State =
           Cadence = 0
           HeartRate = 0
           CapturedAt = DateTime.UtcNow }
+      TesMomentum = []
+      Leaderboard = []
+      ActiveStreamId = "match-1"
       Notifications = [] },
     Cmd.ofMsg Start
 
@@ -54,6 +65,19 @@ module State =
     | MetricsTick metrics ->
         let updated = { model with Metrics = metrics }
         updated, Cmd.ofMsg SendMetrics
+    | TesMomentumUpdated points ->
+        { model with TesMomentum = points }, Cmd.none
+    | LeaderboardUpdated entries ->
+        { model with Leaderboard = entries }, Cmd.none
+    | TrainerEffectReceived (streamId, kind) ->
+        let message = sprintf "Trainer effect for %s: %s" streamId kind
+        pushNotification message model, Cmd.none
+    | SubscribeToStream ->
+        model, Cmd.none
+    | SubscriptionCompleted (Result.Ok _) ->
+        model, Cmd.none
+    | SubscriptionCompleted (Result.Error error) ->
+        pushNotification ($"Subscription failed: {error}") model, Cmd.none
     | SendMetrics ->
         let command =
           Cmd.OfAsync.either
